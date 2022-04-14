@@ -21,12 +21,14 @@
 //! - `json` - Bunyan formatter - JSON log output, optional
 //! - `tokio-console` - [Tokio-console](https://github.com/tokio-rs/console) subscriber, optional
 
+use std::sync::Arc;
+
 #[cfg(feature = "jaeger")]
 use opentelemetry::global;
 #[cfg(feature = "jaeger")]
 use opentelemetry::sdk::propagation::TraceContextPropagator;
 
-use tracing::info;
+use tracing::{info, Subscriber};
 use tracing::subscriber::set_global_default;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter, Registry};
@@ -118,6 +120,48 @@ fn bunyan_json_subscriber(config: &TelemetryConfig, env_filter: EnvFilter, nb_ou
     set_global_default(subscriber).expect("Failed to set subscriber");
 
     info!("Enabling JSON and span logging");
+}
+
+static mut SUBSCRIBER: Option<Arc<dyn tracing::Subscriber + Send + Sync>> = None;
+static SUBSCRIBER_INIT: std::sync::Once = std::sync::Once::new();
+
+pub fn init_jaeger_per_request(config: TelemetryConfig) {
+    SUBSCRIBER_INIT.call_once(|| {
+        let log_level = config.log_level.clone().unwrap_or_else(|| "info".into());
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+        let subscriber = Registry::default().with(env_filter);
+
+        // Install a tracer to send traces to Jaeger.  Batching for better performance.
+        let tracer = opentelemetry_jaeger::new_pipeline()
+            .with_service_name(&config.service_name)
+            .with_max_packet_size(9216) // Default max UDP packet size on OSX
+            .with_auto_split_batch(true) // Auto split batches so they fit under packet size
+            .install_batch(opentelemetry::runtime::Tokio)
+            .expect("Could not create async Tracer");
+
+        // Create a tracing subscriber with the configured tracer
+        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        // Enable Trace Contexts for tying spans together
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        unsafe {
+            SUBSCRIBER = Some(Arc::new(subscriber.with(telemetry)));
+        }
+    });
+}
+
+pub fn get_subscriber() -> Arc<dyn Subscriber + Send + Sync> {
+    SUBSCRIBER_INIT.call_once(|| {
+        panic!("uninitialized subscriber");
+    });
+    unsafe {
+        match &SUBSCRIBER {
+            Some(s) => s.clone(),
+            None => unreachable!()
+        }
+    }
 }
 
 #[cfg(feature = "jaeger")]
