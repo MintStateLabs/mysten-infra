@@ -125,12 +125,20 @@ fn bunyan_json_subscriber(config: &TelemetryConfig, env_filter: EnvFilter, nb_ou
 static mut SUBSCRIBER: Option<Arc<dyn tracing::Subscriber + Send + Sync>> = None;
 static SUBSCRIBER_INIT: std::sync::Once = std::sync::Once::new();
 
-pub fn init_jaeger_per_request(config: TelemetryConfig) {
+pub fn init_jaeger_per_request(config: TelemetryConfig) -> TelemetryGuards {
+    let mut guards = None;
     SUBSCRIBER_INIT.call_once(|| {
         let log_level = config.log_level.clone().unwrap_or_else(|| "info".into());
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-        let subscriber = Registry::default().with(env_filter);
+        let (nb_output, worker_guard) = get_output(&config);
+
+        // Output to file or to stdout with ANSI colors
+        let fmt_layer = fmt::layer()
+            .with_ansi(config.log_file.is_none())
+            .with_writer(nb_output);
+
+        let subscriber = Registry::default().with(env_filter).with(fmt_layer);
 
         // Install a tracer to send traces to Jaeger.  Batching for better performance.
         let tracer = opentelemetry_jaeger::new_pipeline()
@@ -149,7 +157,15 @@ pub fn init_jaeger_per_request(config: TelemetryConfig) {
         unsafe {
             SUBSCRIBER = Some(Arc::new(subscriber.with(telemetry)));
         }
+
+        guards = Some(TelemetryGuards(worker_guard, None));
     });
+
+    if guards.is_none() {
+        panic!("Multiple calls to init_jaeger_per_request");
+    }
+
+    guards.unwrap()
 }
 
 pub fn get_subscriber() -> Arc<dyn Subscriber + Send + Sync> {
